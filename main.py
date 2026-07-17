@@ -541,11 +541,28 @@ async def cb_home(cb: CallbackQuery) -> None:
 @dp.callback_query(F.data == "awake:mark")
 async def cb_awake_mark(cb: CallbackQuery) -> None:
     mark_awake()
-    await cb.answer("☀️ Отметил")
+    r = STATE["reminders"]
+    h = STATE["last_awake_hour"] or 0
+    off = r["touch_offset_hours"]
+    t1 = (h + off[0]) % 24
+    t2 = (h + off[1]) % 24
+    ev = r["evening_time"]
+    text = (
+        f"☀️ <b>Отметил.</b>\n\n"
+        f"Проснулся в <b>{h:02d}:00</b>.\n\n"
+        f"<b>Что это даёт:</b>\n"
+        f"Бот подстраивает расписание дня под тебя, а не жёстко по часам.\n\n"
+        f"<b>Сегодня будет:</b>\n"
+        f"• 👋 Касание в <b>{t1:02d}:00</b> · «как накатывает?»\n"
+        f"• 👋 Касание в <b>{t2:02d}:00</b>\n"
+        f"• 🌙 Вечерний дневник в <b>{ev}</b>\n\n"
+        "<i>Если что не так — /settings поменять расписание.</i>"
+    )
     try:
-        await cb.message.edit_text(render_home(), reply_markup=kb_home())
+        await cb.message.edit_text(text, reply_markup=kb_back_home())
     except Exception:
         pass
+    await cb.answer("☀️")
 
 
 # ---------- SOS (panic protocol) ----------
@@ -1139,18 +1156,32 @@ async def any_text(msg: Message) -> None:
 
     # Are we waiting for an insight text?
     if STATE.get("__partial_insight"):
+        insight_text = msg.text[:1000]
         STATE["insights"].append({
             "ts": now_msk().isoformat(),
-            "text": msg.text[:1000],
+            "text": insight_text,
         })
         STATE["__partial_insight"] = False
         save_state()
         total = len(STATE["insights"])
+
+        # Delete user's message so chat stays clean
+        try:
+            await bot.delete_message(msg.chat.id, msg.message_id)
+        except Exception as e:
+            log.warning("could not delete user's insight msg: %s", e)
+
+        # Show confirmation with preview + link to see all
+        preview = html_escape(insight_text)[:200]
         await msg.answer(
-            f"💡 Записал. Всего инсайтов: <b>{total}</b>.\n\n"
-            "Через месяц перечитаешь — увидишь как менялся.\n"
-            "Все инсайты: /insights",
-            reply_markup=kb_back_home(),
+            f"💡 <b>Записал.</b>\n\n"
+            f"<i>«{preview}»</i>\n\n"
+            f"Всего инсайтов: <b>{total}</b>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Ещё один", callback_data="insight:new")],
+                [InlineKeyboardButton(text=f"📖 Посмотреть все ({total})", callback_data="insight:list")],
+                [InlineKeyboardButton(text="← Домой", callback_data="home")],
+            ]),
         )
         return
 
@@ -1182,23 +1213,77 @@ async def any_text(msg: Message) -> None:
 # ============================================================
 # NEW: Insight (💡)
 # ============================================================
+def render_insights_list() -> str:
+    ins = STATE.get("insights", [])
+    if not ins:
+        return "💡 <b>Инсайты</b>\n\n<i>Пока пусто. Жми «Новый» когда что-то заметишь про себя.</i>"
+    lines = [f"💡 <b>Инсайты · всего {len(ins)}</b>\n"]
+    for entry in ins[-30:][::-1]:
+        try:
+            ts = datetime.fromisoformat(entry["ts"]).astimezone(MSK).strftime("%d.%m %H:%M")
+        except Exception:
+            ts = ""
+        text = html_escape(entry.get("text", ""))[:300]
+        lines.append(f"<i>{ts}</i>\n{text}\n")
+    return "\n".join(lines)
+
+
+def kb_insight_menu() -> InlineKeyboardMarkup:
+    total = len(STATE.get("insights", []))
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Новый инсайт", callback_data="insight:new")],
+        [InlineKeyboardButton(text=f"📖 Посмотреть все ({total})", callback_data="insight:list")],
+        [InlineKeyboardButton(text="← Домой", callback_data="home")],
+    ])
+
+
 @dp.callback_query(F.data == "insight:add")
 async def cb_insight_add(cb: CallbackQuery) -> None:
+    # Show menu: new or list
+    STATE["__partial_insight"] = False  # reset in case
+    save_state()
+    total = len(STATE.get("insights", []))
+    text = (
+        f"💡 <b>Инсайты</b>\n\n"
+        f"Записанных: <b>{total}</b>\n\n"
+        "Что делаем?"
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_insight_menu())
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "insight:new")
+async def cb_insight_new(cb: CallbackQuery) -> None:
     STATE["__partial_insight"] = True
     save_state()
     try:
         await cb.message.edit_text(
-            "💡 <b>Инсайт</b>\n\n"
+            "✍️ <b>Новый инсайт</b>\n\n"
             "Что заметил про себя? Одна-две фразы, как есть.\n\n"
             "Примеры:\n"
             "• «Она не сидит и не ждёт — это моя проекция»\n"
-            "• «Хотел поиграть, но пошёл к ней — это была тревога, не выбор»\n"
+            "• «Хотел поиграть, но пошёл к ней — это была тревога»\n"
             "• «Заходил в чат просто посмотреть 5 раз за час»\n\n"
-            "Пиши следующим сообщением ↓",
+            "<i>Пиши следующим сообщением ↓ Оно сохранится и удалится из чата, чтобы не засорять.</i>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="← Отмена", callback_data="insight:cancel")],
             ]),
         )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "insight:list")
+async def cb_insight_list(cb: CallbackQuery) -> None:
+    try:
+        await cb.message.edit_text(render_insights_list(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Новый инсайт", callback_data="insight:new")],
+            [InlineKeyboardButton(text="← Домой", callback_data="home")],
+        ]))
     except Exception:
         pass
     await cb.answer()
@@ -1217,20 +1302,10 @@ async def cb_insight_cancel(cb: CallbackQuery) -> None:
 
 @dp.message(Command("insights"))
 async def cmd_insights(msg: Message) -> None:
-    ins = STATE.get("insights", [])
-    if not ins:
-        await msg.answer("💡 Пока нет инсайтов. Жми «💡 Инсайт» на главной когда что-то заметишь про себя.",
-                         reply_markup=kb_back_home())
-        return
-    lines = [f"💡 <b>Инсайты · всего {len(ins)}</b>\n"]
-    for entry in ins[-30:][::-1]:
-        try:
-            ts = datetime.fromisoformat(entry["ts"]).astimezone(MSK).strftime("%d.%m %H:%M")
-        except Exception:
-            ts = ""
-        text = html_escape(entry.get("text", ""))[:300]
-        lines.append(f"<i>{ts}</i>\n{text}\n")
-    await msg.answer("\n".join(lines), reply_markup=kb_back_home())
+    await msg.answer(render_insights_list(), reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Новый инсайт", callback_data="insight:new")],
+        [InlineKeyboardButton(text="← Домой", callback_data="home")],
+    ]))
 
 
 # ============================================================
