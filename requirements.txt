@@ -2,6 +2,6 @@ aiogram==3.15.0
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
-aiohttp==3.11.10
+aiohttp==3.10.11
 apscheduler==3.11.0
 pytz==2024.2
