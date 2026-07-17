@@ -90,6 +90,10 @@ def _default_state() -> dict[str, Any]:
         "touches": [],            # list of {ts, level: "ok"|"rising"|"peak"}
         "journal": [],            # list of {date, trigger, action, truth}
         "panic_sessions": [],     # list of {started, ended, activity, wanted_to_write, cycles, won}
+        "insights": [],           # list of {ts, text} — самопоймённые мысли
+        "chat_peeks": [],         # list of {ts} — "заглянул в чат" — трекинг дофаминовой петли
+        "self_checks": [],        # list of {ts, answers} — прохождение "проверить себя"
+        "__partial_insight": False,  # флаг "жду текст инсайта"
         "wave2_offered_at": None,
         "wave3_offered_at": None,
         # Reminder schedule (MSK). Bot uses awake-adaptive offsets when possible,
@@ -300,7 +304,15 @@ def kb_home() -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="🆘 Накатывает", callback_data="sos:start"),
+            InlineKeyboardButton(text="🧠 Проверить себя", callback_data="check:start"),
+        ],
+        [
+            InlineKeyboardButton(text="💡 Инсайт", callback_data="insight:add"),
+            InlineKeyboardButton(text="🔴 Заглянул в чат", callback_data="peek:add"),
+        ],
+        [
             InlineKeyboardButton(text="😴 Ложусь", callback_data="sleep:start"),
+            InlineKeyboardButton(text="📚 Инструменты", callback_data="tools:open"),
         ],
         [
             InlineKeyboardButton(text="📝 Дневник", callback_data="journal:open"),
@@ -941,6 +953,32 @@ def render_stats() -> str:
     slips = STATE.get("total_slips", 0)
     wave = STATE.get("wave", 1)
 
+    # Chat peek stats — this week vs prev week
+    now = now_msk()
+    week_start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now.weekday())
+    prev_week_start = week_start - timedelta(days=7)
+    this_week_peeks = 0
+    prev_week_peeks = 0
+    for p in STATE.get("chat_peeks", []):
+        try:
+            ts = datetime.fromisoformat(p["ts"]).astimezone(MSK)
+            if ts >= week_start:
+                this_week_peeks += 1
+            elif ts >= prev_week_start:
+                prev_week_peeks += 1
+        except Exception:
+            pass
+    peek_line = ""
+    if this_week_peeks or prev_week_peeks:
+        if prev_week_peeks:
+            arrow = "↓" if this_week_peeks < prev_week_peeks else ("↑" if this_week_peeks > prev_week_peeks else "→")
+            peek_line = f"🔴 Заходов в чат: <b>{this_week_peeks}</b> {arrow} (было {prev_week_peeks})\n"
+        else:
+            peek_line = f"🔴 Заходов в чат за неделю: <b>{this_week_peeks}</b>\n"
+
+    insights_count = len(STATE.get("insights", []))
+    insights_line = f"💡 Инсайтов: <b>{insights_count}</b>\n" if insights_count else ""
+
     # Anxiety trend — average of last 7 check-ins vs previous 7
     checkins = STATE.get("checkins", [])
     trend_line = ""
@@ -971,7 +1009,9 @@ def render_stats() -> str:
         f"💪 Streak побед: <b>{streak}</b>\n"
         f"💪 Всего побед: <b>{wins}</b>\n"
         f"😞 Срывов: <b>{slips}</b>\n"
-        f"🆘 SOS-сессий: <b>{total_sessions}</b>\n\n"
+        f"🆘 SOS-сессий: <b>{total_sessions}</b>\n"
+        f"{peek_line}"
+        f"{insights_line}\n"
         f"{trend_line}"
         f"{sleep_line}\n"
         "<i>Тревога снижается медленно и с колебаниями. "
@@ -1088,12 +1128,31 @@ async def cb_settings_set_wave(cb: CallbackQuery) -> None:
         pass
 
 
-# ---------- Free text = journal note ----------
+# ---------- Free text = journal note or insight ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def any_text(msg: Message) -> None:
-    """Свободный текст = запись в дневник (если сегодня уже был check-in)
-    или регистрация как «проснулся» + начать check-in."""
+    """Свободный текст:
+      - если ждём инсайт → записать в insights
+      - если первое сообщение дня → awake
+      - иначе → журнал."""
     today = today_iso()
+
+    # Are we waiting for an insight text?
+    if STATE.get("__partial_insight"):
+        STATE["insights"].append({
+            "ts": now_msk().isoformat(),
+            "text": msg.text[:1000],
+        })
+        STATE["__partial_insight"] = False
+        save_state()
+        total = len(STATE["insights"])
+        await msg.answer(
+            f"💡 Записал. Всего инсайтов: <b>{total}</b>.\n\n"
+            "Через месяц перечитаешь — увидишь как менялся.\n"
+            "Все инсайты: /insights",
+            reply_markup=kb_back_home(),
+        )
+        return
 
     # First interaction of the day → mark awake
     if STATE.get("last_awake_date") != today:
@@ -1118,6 +1177,316 @@ async def any_text(msg: Message) -> None:
         "📝 Записал в дневник. Через 2 недели увидим паттерн.",
         reply_markup=kb_back_home(),
     )
+
+
+# ============================================================
+# NEW: Insight (💡)
+# ============================================================
+@dp.callback_query(F.data == "insight:add")
+async def cb_insight_add(cb: CallbackQuery) -> None:
+    STATE["__partial_insight"] = True
+    save_state()
+    try:
+        await cb.message.edit_text(
+            "💡 <b>Инсайт</b>\n\n"
+            "Что заметил про себя? Одна-две фразы, как есть.\n\n"
+            "Примеры:\n"
+            "• «Она не сидит и не ждёт — это моя проекция»\n"
+            "• «Хотел поиграть, но пошёл к ней — это была тревога, не выбор»\n"
+            "• «Заходил в чат просто посмотреть 5 раз за час»\n\n"
+            "Пиши следующим сообщением ↓",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="← Отмена", callback_data="insight:cancel")],
+            ]),
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "insight:cancel")
+async def cb_insight_cancel(cb: CallbackQuery) -> None:
+    STATE["__partial_insight"] = False
+    save_state()
+    try:
+        await cb.message.edit_text(render_home(), reply_markup=kb_home())
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.message(Command("insights"))
+async def cmd_insights(msg: Message) -> None:
+    ins = STATE.get("insights", [])
+    if not ins:
+        await msg.answer("💡 Пока нет инсайтов. Жми «💡 Инсайт» на главной когда что-то заметишь про себя.",
+                         reply_markup=kb_back_home())
+        return
+    lines = [f"💡 <b>Инсайты · всего {len(ins)}</b>\n"]
+    for entry in ins[-30:][::-1]:
+        try:
+            ts = datetime.fromisoformat(entry["ts"]).astimezone(MSK).strftime("%d.%m %H:%M")
+        except Exception:
+            ts = ""
+        text = html_escape(entry.get("text", ""))[:300]
+        lines.append(f"<i>{ts}</i>\n{text}\n")
+    await msg.answer("\n".join(lines), reply_markup=kb_back_home())
+
+
+# ============================================================
+# NEW: Chat peek tracker (🔴)
+# ============================================================
+@dp.callback_query(F.data == "peek:add")
+async def cb_peek_add(cb: CallbackQuery) -> None:
+    STATE["chat_peeks"].append({"ts": now_msk().isoformat()})
+    save_state()
+
+    # Count today's + this week's peeks
+    now = now_msk()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=now.weekday())
+    today_count = 0
+    week_count = 0
+    for p in STATE["chat_peeks"]:
+        try:
+            ts = datetime.fromisoformat(p["ts"]).astimezone(MSK)
+            if ts >= today_start:
+                today_count += 1
+            if ts >= week_start:
+                week_count += 1
+        except Exception:
+            pass
+
+    text = (
+        f"🔴 Отметил.\n\n"
+        f"<b>Сегодня:</b> {today_count} заходов\n"
+        f"<b>На этой неделе:</b> {week_count}\n\n"
+        "<i>Просто открывать чат «посмотреть» = дофаминовая петля. "
+        "Каждый заход даёт микро-успокоение, потом хочется ещё. "
+        "Как соцсети.</i>\n\n"
+        "<b>Разорвать цикл:</b> не заходить 20 минут. Заняться другим. "
+        "Через 20 мин импульс упадёт естественно.\n\n"
+        "Каждый пропущенный заход = переучивание."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_back_home())
+    except Exception:
+        pass
+    await cb.answer("🔴 записал")
+
+
+# ============================================================
+# NEW: Self-check (🧠) — 5 вопросов один за другим
+# ============================================================
+CHECK_QUESTIONS = [
+    ("factual", "Это <b>факт</b> или я это <b>додумал</b>?",
+     "Что реально случилось? Что она реально сказала/сделала? "
+     "Отдели факт от того что ты про это подумал."),
+
+    ("fear", "Чего я боюсь что <b>произойдёт</b>?",
+     "Проговори конкретно. Не «будет плохо», а «она обидится / уйдёт / разлюбит»."),
+
+    ("reality", "Что <b>реально</b> произойдёт если я не отреагирую сейчас?",
+     "Через час — как будет? Через день? Скорее всего — ничего не изменится. "
+     "Твой страх — из головы, не из реальности."),
+
+    ("horizon", "Через <b>24 часа</b> это будет важно?",
+     "Если через сутки будет всё равно — значит и сейчас можно отпустить. "
+     "90% тревог не переживают ночь."),
+
+    ("motive", "Что я хочу этим действием <b>получить</b>?",
+     "Успокоиться? Проверить что она в порядке? Получить подтверждение любви? "
+     "Скорее всего — маленькую дозу успокоения. Как проверка соцсетей."),
+]
+
+
+def kb_check_answer(step: int) -> InlineKeyboardMarkup:
+    """Buttons after each check question — 'next' or 'exit'."""
+    if step < len(CHECK_QUESTIONS) - 1:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="→ Следующий вопрос", callback_data=f"check:next:{step + 1}")],
+            [InlineKeyboardButton(text="← Домой", callback_data="home")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Готово", callback_data="check:done")],
+        [InlineKeyboardButton(text="← Домой", callback_data="home")],
+    ])
+
+
+def render_check_step(step: int) -> str:
+    key, question, hint = CHECK_QUESTIONS[step]
+    return (
+        f"🧠 <b>Проверить себя · {step + 1}/{len(CHECK_QUESTIONS)}</b>\n\n"
+        f"{question}\n\n"
+        f"<i>{hint}</i>\n\n"
+        "Подумай минуту (не спеши), потом → следующий."
+    )
+
+
+@dp.callback_query(F.data == "check:start")
+async def cb_check_start(cb: CallbackQuery) -> None:
+    try:
+        await cb.message.edit_text(render_check_step(0), reply_markup=kb_check_answer(0))
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("check:next:"))
+async def cb_check_next(cb: CallbackQuery) -> None:
+    step = int(cb.data.split(":")[2])
+    if step >= len(CHECK_QUESTIONS):
+        step = len(CHECK_QUESTIONS) - 1
+    try:
+        await cb.message.edit_text(render_check_step(step), reply_markup=kb_check_answer(step))
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "check:done")
+async def cb_check_done(cb: CallbackQuery) -> None:
+    STATE["self_checks"].append({"ts": now_msk().isoformat()})
+    save_state()
+    text = (
+        "🧠 <b>Проверка завершена.</b>\n\n"
+        "Если по большинству вопросов ответы указывают что это <b>тревога</b>, "
+        "а не факт — правильный ход:\n\n"
+        "• <b>Не действуй сейчас</b>. 20 минут таймер.\n"
+        "• Займись чем-то <b>своим</b>.\n"
+        "• Через час перечитай — увидишь что тревога стихла.\n\n"
+        "<i>Каждая такая проверка = переучивание нервной системы. "
+        "Через 20-30 раз становится автоматически.</i>"
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆘 Запустить SOS-таймер", callback_data="sos:start")],
+            [InlineKeyboardButton(text="← Домой", callback_data="home")],
+        ]))
+    except Exception:
+        pass
+    await cb.answer()
+
+
+# ============================================================
+# NEW: Tools section (📚)
+# ============================================================
+def kb_tools() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Проекция vs факт", callback_data="tools:projection")],
+        [InlineKeyboardButton(text="🔴 Дофаминовая петля", callback_data="tools:dopamine")],
+        [InlineKeyboardButton(text="🕊 Свобода партнёру", callback_data="tools:freedom")],
+        [InlineKeyboardButton(text="🙅 Как сказать «нет»", callback_data="tools:no")],
+        [InlineKeyboardButton(text="⚡ Ресурс vs пустота", callback_data="tools:resource")],
+        [InlineKeyboardButton(text="← Домой", callback_data="home")],
+    ])
+
+
+@dp.callback_query(F.data == "tools:open")
+async def cb_tools_open(cb: CallbackQuery) -> None:
+    text = (
+        "📚 <b>Инструменты</b>\n\n"
+        "Короткие шпаргалки по тому что мы разбирали. "
+        "Читай когда накрывает — помогает узнать механизм и не тонуть в нём."
+    )
+    try:
+        await cb.message.edit_text(text, reply_markup=kb_tools())
+    except Exception:
+        pass
+    await cb.answer()
+
+
+TOOL_TEXTS = {
+    "projection": (
+        "🎯 <b>Проекция vs факт</b>\n\n"
+        "<b>Что это.</b> Ты приписываешь ей своё же состояние. "
+        "«Она сейчас злится / ждёт / думает плохо» — обычно ты это <b>додумал</b>, "
+        "а не она реально это сделала.\n\n"
+        "<b>Простая проверка</b> когда накрывает:\n"
+        "• Это <b>факт</b> или я это <b>додумал</b>?\n"
+        "• Я это <b>знаю</b> или <b>предполагаю</b>?\n\n"
+        "В 90% случаев — предположение. Мозг рисует картину, а ты в ней живёшь как в реальности.\n\n"
+        "<b>Пример:</b>\n"
+        "❌ «Она не отвечает 3 часа — злится на меня»\n"
+        "✅ Факт: не отвечает 3 часа. Причина — <b>неизвестна</b>. "
+        "Скорее всего просто занята / забыла / телефон в другой комнате."
+    ),
+    "dopamine": (
+        "🔴 <b>Дофаминовая петля проверок</b>\n\n"
+        "Каждый раз когда «просто посмотрел» её сторис / чат / статус — "
+        "мозг получает <b>микро-дозу</b> успокоения. Через 30-60 минут дозы "
+        "выдыхается — тянет проверить ещё раз.\n\n"
+        "Та же нейросхема что в TikTok / соцсетях. <b>Ты подсажен на её обновления.</b>\n\n"
+        "<b>Что делать:</b>\n"
+        "1. Каждый заход «просто посмотреть» = жми 🔴 <b>«Заглянул в чат»</b> на главной. Считай.\n"
+        "2. Хочется зайти → спроси себя: <b>«Что я хочу узнать?»</b> Ответ обычно: «не изменилось ли». Ответ реальный: не изменилось.\n"
+        "3. Не заходи 20 минут. Импульс упадёт естественно.\n\n"
+        "<b>Через 2-3 недели</b> счётчик заходов начнёт снижаться. Это доказательство переучивания."
+    ),
+    "freedom": (
+        "🕊 <b>Свобода партнёру</b>\n\n"
+        "Когда она говорит <i>«хочу спать / пойду с подругой / устала»</i> — "
+        "у тебя внутри поднимается «не хочу». Это <b>не жадность</b> — это тревога отсутствия контакта.\n\n"
+        "<b>Мини-практика.</b> В момент когда она говорит что уходит/устала — "
+        "проговори в голове:\n\n"
+        "<i>«Она сказала [что]. Во мне поднимается [не хочу / жалко]. "
+        "Это моя тревога. Не её проблема.»</i>\n\n"
+        "Всё. Дальше отвечаешь обычно — «хорошо, отдыхай». Но <b>без сдержанного раздражения</b> "
+        "(она это по тону считывает).\n\n"
+        "<b>Через 2-3 недели</b> реакция стихает сама. Мозг перестаёт видеть «она недоступна» = «опасность»."
+    ),
+    "no": (
+        "🙅 <b>Как сказать «нет»</b>\n\n"
+        "Не «нет и всё». Мягко, с уважением, но чётко. С альтернативой.\n\n"
+        "<b>Рабочие формулировки:</b>\n\n"
+        "• <i>«Хочу с тобой, но сейчас в игре. Давай через час?»</i>\n"
+        "• <i>«Не сегодня, устал. Завтра?»</i>\n"
+        "• <i>«Дай мне доиграть, потом сразу пишу»</i>\n"
+        "• <i>«Хочу закончить, вернусь минут через 30»</i>\n\n"
+        "<b>Тренировка:</b> начни с самых безопасных ситуаций. Одно «через час» на этой неделе. "
+        "Заметишь: <b>ничего не рушится</b>. Она подождёт (или нет — тоже норм). "
+        "Живём дальше.\n\n"
+        "<b>Парадокс:</b> партнёр, который никогда не отказывает, кажется слабым. "
+        "Партнёр, который иногда говорит «нет» — воспринимается как <b>надёжный</b>, "
+        "у которого есть свои желания. К такому тянет."
+    ),
+    "resource": (
+        "⚡ <b>Ресурс vs пустота</b>\n\n"
+        "После любой активности спроси себя:\n\n"
+        "• Чувствую <b>наполнение</b> (даже если устал) → <b>ресурс</b> ✅\n"
+        "• Чувствую <b>пустоту / тревогу</b> → <b>ложный ресурс</b> ❌\n\n"
+        "<b>Настоящий ресурс:</b>\n"
+        "• Тело — физика 3-4 раза в неделю\n"
+        "• Друзья — 1-2 близких помимо неё\n"
+        "• Дело — работа / учёба / проект где растёшь\n"
+        "• Своё — час-два в день где ты с собой\n\n"
+        "<b>Маскируется под ресурс:</b>\n"
+        "• Скролл TikTok / соцсетей\n"
+        "• Игры тупые (не цель)\n"
+        "• Проверка её сторис\n"
+        "• Тусовки без близости\n"
+        "• Работа как бегство\n\n"
+        "<b>Одно на этой неделе:</b> позвони одному другу и предложи встретиться. "
+        "Или пойди на 3 пробежки. <b>Одно</b>. Не больше. "
+        "Через неделю добавишь ещё."
+    ),
+}
+
+
+@dp.callback_query(F.data.startswith("tools:") & (F.data != "tools:open"))
+async def cb_tool(cb: CallbackQuery) -> None:
+    key = cb.data.split(":", 1)[1]
+    if key not in TOOL_TEXTS:
+        await cb.answer("Не найдено")
+        return
+    try:
+        await cb.message.edit_text(TOOL_TEXTS[key], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="← В инструменты", callback_data="tools:open")],
+            [InlineKeyboardButton(text="🏠 Домой", callback_data="home")],
+        ]))
+    except Exception:
+        pass
+    await cb.answer()
 
 
 # ---------- Scheduler ----------
