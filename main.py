@@ -1789,15 +1789,19 @@ async def lifespan(_: FastAPI):
         STATE.get("owner_chat_id"), STATE.get("wave"), STATE.get("streak", 0),
     )
     yield
-    log.info("Shutting down — removing webhook")
+    log.info("Shutting down")
     try:
         scheduler.shutdown(wait=False)
     except Exception:
         pass
-    try:
-        await asyncio.wait_for(bot.delete_webhook(), timeout=10.0)
-    except Exception:
-        log.exception("delete_webhook failed on shutdown")
+    # Only delete webhook if we own it. SKIP_SETWEBHOOK=1 → someone else manages it (external relay)
+    if os.environ.get("SKIP_SETWEBHOOK", "").strip() in ("1", "true", "yes"):
+        log.info("SKIP_SETWEBHOOK set — leaving Telegram webhook alone")
+    else:
+        try:
+            await asyncio.wait_for(bot.delete_webhook(), timeout=10.0)
+        except Exception:
+            log.exception("delete_webhook failed on shutdown")
     try:
         await session.close()
     except Exception:
